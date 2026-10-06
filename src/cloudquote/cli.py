@@ -85,9 +85,14 @@ def _cmd_eval(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_ui(settings: Settings, args: argparse.Namespace) -> int:  # pragma: no cover
+def _cmd_ui(settings: Settings, args: argparse.Namespace) -> int:
     app = Path(__file__).parent / "app" / "streamlit_app.py"
-    return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), *args.streamlit_args])
+    extra = list(args.streamlit_args)
+    if extra[:1] == ["--"]:
+        # `cloudquote ui -- --server.port 8502`: the separator is for argparse. Streamlit would pass
+        # everything after a `--` to the script instead of reading it as its own options.
+        extra = extra[1:]
+    return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), *extra])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -105,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--eval-set", default=str(DEFAULT_EVAL_SET))
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=_cmd_eval)
-    s = sub.add_parser("ui", help="launch the Streamlit app (needs the 'ui' extra)")
+    s = sub.add_parser("ui", help="launch the Streamlit app (needs the 'ui' extra), e.g. ui -- --server.port 8502")
     s.add_argument("streamlit_args", nargs=argparse.REMAINDER)
     s.set_defaults(func=_cmd_ui)
     return p

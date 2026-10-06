@@ -96,3 +96,14 @@ def test_cli_catalog_and_eval(capsys):
     assert "aws:s3-standard" in capsys.readouterr().out
     assert main(["--env-file", "none.env", "eval", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["n"] >= 15
+
+
+def test_cli_ui_passes_streamlit_options_after_the_separator(monkeypatch):
+    calls = []
+    monkeypatch.setattr("cloudquote.cli.subprocess.call", lambda cmd: calls.append(cmd) or 0)
+    assert main(["--env-file", "none.env", "ui", "--", "--server.port", "8502"]) == 0
+    assert main(["--env-file", "none.env", "ui"]) == 0
+    first, second = calls
+    assert first[2:4] == ["streamlit", "run"] and first[-2:] == ["--server.port", "8502"]
+    assert "--" not in first
+    assert second[-1].endswith("streamlit_app.py")

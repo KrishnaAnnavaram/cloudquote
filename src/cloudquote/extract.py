@@ -21,7 +21,9 @@ from .llm import LLM, LLMError
 from .spec import ComputeSpec, Requirement, StorageSpec, llm_json_schema
 from .units import HOURS_PER_MONTH, hours_per_month, months_from, to_gb
 
-_NUM = r"(\d+(?:[.,]\d+)?)"
+# "1,000" and "2,500.5" use a thousands separator. Any other comma is a decimal comma ("1,5" = 1.5).
+_THOUSANDS = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+_NUM = r"(" + _THOUSANDS + r"|\d+(?:[.,]\d+)?)"
 _SIZE = _NUM + r"\s*(pib|pb|tib|tb|gib|gb|mib|mb)\b"
 _VCPU_RE = re.compile(_NUM + r"\s*(?:x\s*)?(?:v\s*cpus?|vcpus?|cpus?|cores?|virtual cpus?)\b", re.I)
 _RAM_RE = re.compile(_NUM + r"\s*(gib|gb|g)\b\s*(?:of\s+)?(?:ram|memory)", re.I)
@@ -69,6 +71,8 @@ class Extractor(Protocol):
 
 
 def _num(s: str) -> Decimal:
+    if re.fullmatch(_THOUSANDS, s):
+        return Decimal(s.replace(",", ""))
     return Decimal(s.replace(",", "."))
 
 

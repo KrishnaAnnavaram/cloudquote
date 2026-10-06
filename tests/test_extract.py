@@ -111,3 +111,12 @@ def test_llm_errors_fall_back_too():
 
     ex = LLMExtractor(Down()).extract("500 GB of frequently read files")
     assert ex.method == "rules" and ex.requirement.storage.size_gb == 500
+
+
+def test_thousands_separator_is_not_a_decimal_comma():
+    r = rules.extract("10,000 GB of logs and 2,500 GB egress per month").requirement
+    assert r.storage.size_gb == 10000 and r.egress_gb_per_month == 2500
+    assert rules.extract("1,000 GB of files").requirement.storage.size_gb == 1000
+    assert rules.extract("1,5 TB of files").requirement.storage.size_gb == 1536     # decimal comma
+    with pytest.raises(ExtractionError, match="730"):
+        rules.extract("4 vCPUs and 16 GiB RAM, 1,000 hours per month")
