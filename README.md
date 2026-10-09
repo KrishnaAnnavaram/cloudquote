@@ -74,6 +74,7 @@ This README is the **one location that explains all of cloudquote**. It gives th
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one quote](#42-the-life-cycle-of-one-quote)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📏 [The billing units](#5-the-billing-units)
 6. 🔵 [The requirement schema](#6-the-requirement-schema)
 7. 🟢 [The rule-based extractor](#7-the-rule-based-extractor)
@@ -148,6 +149,56 @@ flowchart LR
 | Streamlit UI | `src/cloudquote/app/streamlit_app.py` | Text, editable spec, side-by-side quotes, JSON download |
 | Package data | `src/cloudquote/data/` | `sample_catalog.json` and `eval_set.jsonl` |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph FRONT["Front ends"]
+        CLI["cli.py<br/>cloudquote command"]
+        UI["app/streamlit_app.py<br/>Streamlit page"]
+    end
+    CFG["config.py<br/>Settings, load_dotenv"]
+    SVC["service.py<br/>QuoteService"]
+    subgraph EXTRACT["Extraction"]
+        EXT["extract.py<br/>RuleBasedExtractor, LLMExtractor"]
+        LLM["llm.py<br/>build_llm, adapters"]
+        SPEC["spec.py<br/>Requirement"]
+    end
+    subgraph PRICE["Pricing"]
+        CAT["catalog.py<br/>load_catalog, Catalog"]
+        MAT["matcher.py<br/>match_compute, match_storage"]
+        COST["cost.py<br/>estimate, verify_quote"]
+        UNITS["units.py<br/>D, to_gb, money"]
+    end
+    subgraph REPORT["Reports"]
+        EXP["explain.py<br/>explain, explain_with_llm"]
+        EVA["evaluate.py<br/>evaluate, load_eval_set"]
+    end
+    DATA[("data/<br/>sample_catalog.json, eval_set.jsonl")]
+    CLI --> CFG
+    UI --> CFG
+    CLI --> SVC
+    UI --> SVC
+    CLI --> EXP
+    UI --> EXP
+    CLI --> EVA
+    CFG --> CAT
+    CFG --> EXT
+    CFG --> LLM
+    SVC --> EXT
+    SVC --> COST
+    EXT --> LLM
+    EXT --> SPEC
+    EXT --> UNITS
+    COST --> MAT
+    MAT --> CAT
+    COST --> UNITS
+    EVA --> COST
+    EXP --> LLM
+    CAT --> DATA
+    EVA --> DATA
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -188,6 +239,24 @@ cloudquote/
 ### 3.1 The LLM never selects a SKU
 The LLM only fills the `Requirement` schema. The matcher selects SKUs from the catalog with fixed rules. Thus each recommendation is a real catalog entry that meets the requested vCPUs, RAM and GPUs.
 
+The diagram shows the two places where an LLM can act, and the check after each place.
+
+```mermaid
+flowchart LR
+    TXT[/"Requirement text"/] --> LX["LLM writes JSON"]
+    LX --> VAL{"Requirement.model_validate_json"}
+    VAL -- "invalid" --> RB["RuleBasedExtractor"]
+    VAL -- "valid" --> REQ["Requirement"]
+    RB --> REQ
+    REQ --> MAT["matcher.py: fixed rules,<br/>no LLM"]
+    CAT[("Catalog JSON")] --> MAT
+    MAT --> COST["cost.py: Decimal,<br/>verify_quote"]
+    COST --> LE["LLM rewrites the explanation"]
+    LE --> NUM{"numbers_consistent"}
+    NUM -- "new dollar amount" --> DET[/"Deterministic explanation"/]
+    NUM -- "pass" --> OUT[/"LLM explanation"/]
+```
+
 ### 3.2 Each requirement passes one schema
 The rule-based extractor, the LLM extractor and a JSON file all produce a `Requirement`. Pydantic validates each field range and forbids unknown fields. A bad requirement gives a validation error with a clear message, not a crash in the cost code.
 
@@ -213,24 +282,59 @@ The deterministic explanation is always available. An LLM text is accepted only 
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    TXT["Requirement text"] --> EXT{"CLOUDQUOTE_EXTRACTOR"}
+flowchart TD
+    TXT[/"Requirement text"/] --> EXT{"CLOUDQUOTE_EXTRACTOR"}
     EXT -- "rules (default)" --> RB["RuleBasedExtractor"]
     EXT -- "llm" --> LX["LLMExtractor: JSON, validate, 1 retry"]
     LX -- "rejected or LLM error" --> RB
-    SPEC["Requirement JSON (--spec or UI editor)"] --> REQ
+    SPEC[/"Requirement JSON (--spec or UI editor)"/] --> REQ
     RB --> REQ["Requirement (validated)"]
     LX --> REQ
-    CAT["Catalog JSON (validated)"] --> MATCH
-    REQ --> MATCH["Matcher: cheapest SKU for each part and provider"]
-    MATCH --> COST["Line items with unit pairs"]
+    REQ --> MATCH
+    REQ -. "Streamlit UI" .-> HUMAN{{"HUMAN<br/>check the assumptions,<br/>edit the JSON spec"}}
+    HUMAN -. "edited JSON" .-> SPEC
+    CAT[("Catalog JSON (validated)")] --> MATCH
+    MATCH["Matcher: cheapest SKU for each part and provider"] --> FOUND{"SKU found?"}
+    FOUND -- "no" --> UNAV["Part goes into unavailable"]
+    FOUND -- "yes" --> COST["Line items with unit pairs"]
     COST --> VER["verify_quote"]
+    UNAV --> EST
     VER --> EST["Estimate: quotes, assumptions, cheapest"]
     EST --> EXP["Explanation (deterministic or number-checked LLM)"]
-    EST --> OUT["CLI text, JSON or Streamlit columns"]
+    EST --> OUT[/"CLI text, JSON or Streamlit columns"/]
+    EXP --> OUT
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one quote
+
+```mermaid
+stateDiagram-v2
+    state "Requirement text or JSON spec" as Input
+    state "Validated Requirement" as Req
+    state "Lines for one provider" as Lines
+    state "Verified Quote" as Verified
+    state "Complete quote" as Complete
+    state "Not complete quote" as NotComplete
+    state "Estimate with cheapest" as Est
+    [*] --> Input
+    Input --> ExtractionError: empty text or invalid result
+    Input --> ValidationError: invalid JSON spec
+    Input --> Req: extract or model_validate_json
+    Req --> Lines: match_compute, match_storage, Catalog.egress
+    Lines --> Verified: verify_quote passes
+    Lines --> ValueError: rate or unit not from the SKU
+    Verified --> Complete: unavailable is empty
+    Verified --> NotComplete: one or more parts not priced
+    Complete --> Est: can be the cheapest
+    NotComplete --> Est: cannot be the cheapest
+    Est --> [*]: printed, JSON or UI columns
+    ExtractionError --> [*]: error, exit code 1
+    ValidationError --> [*]: error, exit code 1
+    ValueError --> [*]: error, exit code 1
+```
 
 1. The user gives a text, a text on standard input, or a JSON spec file.
 2. The extractor changes the text into a `Requirement`, plus a list of assumptions.
@@ -241,11 +345,66 @@ flowchart TB
 7. The `Estimate` selects the cheapest complete quote by monthly total.
 8. The CLI or the UI shows the lines, the totals, the warnings and the explanation.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Engineer
+    participant CLI as cloudquote CLI
+    participant CFG as Settings
+    participant SVC as QuoteService
+    participant EXT as Extractor
+    participant LLM as LLM provider
+    participant COST as cost.estimate
+    participant CAT as Catalog
+
+    U->>CLI: cloudquote quote with the requirement text
+    CLI->>CLI: load_dotenv(--env-file)
+    CLI->>CFG: Settings.from_env
+    CFG->>CAT: load_catalog, validate
+    CFG-->>CLI: catalog and extractor_impl
+    CLI->>SVC: from_text(text)
+    SVC->>EXT: extract(text)
+    opt CLOUDQUOTE_EXTRACTOR=llm
+        EXT->>LLM: complete(prompt, EXTRACT_SYSTEM, schema)
+        LLM-->>EXT: JSON reply
+    end
+    EXT-->>SVC: Extraction with requirement and assumptions
+    SVC->>COST: estimate(catalog, requirement)
+    loop each provider in requirement.providers
+        COST->>CAT: match SKUs, then verify_quote
+    end
+    COST-->>SVC: Estimate
+    SVC-->>CLI: Extraction, Estimate
+    CLI-->>U: lines, totals, warnings, cheapest
+    opt CLOUDQUOTE_EXPLAIN_WITH_LLM is true
+        CLI->>LLM: rewrite the explanation
+        LLM-->>CLI: text, kept only if numbers_consistent
+    end
+    CLI-->>U: explanation
+```
+
 ---
 
 ## 5. The billing units
 
 **Purpose.** Keep one set of billing conventions for all calculations.
+
+```mermaid
+flowchart LR
+    NUM[/"Number from text or JSON"/] --> D["D(): Decimal through str"]
+    D --> GB["to_gb: MB to PiB,<br/>1 TB = 1024 GB"]
+    D --> HRS["hours_per_month:<br/>per day, week or month"]
+    D --> MON["months_from:<br/>days, weeks, months, years"]
+    HRS --> LIM{"More than 24 h/day,<br/>168 h/week or 730 h/month?"}
+    LIM -- "yes" --> ERR[/"ValueError"/]
+    LIM -- "no" --> CALC["Decimal calculation in cost.py"]
+    GB --> CALC
+    MON --> CALC
+    CALC --> MONEY["money: round to CENT,<br/>ROUND_HALF_UP"]
+    MONEY --> FMT[/"fmt_money: $1,234.56"/]
+```
 
 | Constant | Value | Use |
 |---|---|---|
@@ -268,6 +427,20 @@ flowchart TB
 ## 6. The requirement schema
 
 **Purpose.** Give one validated structure for each estimate.
+
+```mermaid
+flowchart TD
+    IN[/"Extractor output, JSON file or UI JSON"/] --> EXTRA{"Unknown field?"}
+    EXTRA -- "yes" --> ERR[/"ValidationError"/]
+    EXTRA -- "no" --> RANGE{"Each field in its range?<br/>ComputeSpec, StorageSpec"}
+    RANGE -- "no" --> ERR
+    RANGE -- "yes" --> EMPTY{"No compute, no storage<br/>and no egress?"}
+    EMPTY -- "yes" --> ERR
+    EMPTY -- "no" --> REP{"A provider repeats?"}
+    REP -- "yes" --> ERR
+    REP -- "no" --> OK[/"Frozen Requirement"/]
+    OK --> SCH["llm_json_schema:<br/>same model for the LLM prompt"]
+```
 
 | Model | Field | Rule |
 |---|---|---|
@@ -296,6 +469,26 @@ flowchart TB
 ## 7. The rule-based extractor
 
 **Purpose.** Change a requirement text into a `Requirement` with regular expressions, offline and deterministic.
+
+```mermaid
+flowchart TD
+    IN[/"Requirement text"/] --> EMPTY{"Empty text?"}
+    EMPTY -- "yes" --> ERR[/"ExtractionError"/]
+    EMPTY -- "no" --> CPU["_VCPU_RE, _RAM_RE, _GPU_RE:<br/>highest value of each"]
+    CPU --> HASC{"vCPUs, RAM or GPUs found?"}
+    HASC -- "yes" --> DEF["Defaults for vCPUs and RAM,<br/>each one an assumption"]
+    DEF --> HRS["_hours: hours per day, week, month,<br/>business hours or 730"]
+    HRS --> CNT["_COUNT_RE count,<br/>_WORKLOAD_RULES workload"]
+    HASC -- "no" --> SIZE
+    CNT --> SIZE["_size_mentions: role ram,<br/>egress, retrieval or storage"]
+    SIZE --> ACC["_ACCESS_RULES: access pattern"]
+    ACC --> TERM["_TERM_RE: term, else 1 month"]
+    TERM --> ONLY["_ONLY_RE: provider restriction"]
+    ONLY --> BUILD{"Requirement valid?"}
+    BUILD -- "no" --> ERR
+    BUILD -- "yes" --> OUT[/"Extraction: requirement,<br/>method rules, assumptions"/]
+    HRS -- "impossible hours" --> ERR
+```
 
 | Input | Output |
 |---|---|
@@ -331,9 +524,24 @@ flowchart TB
 
 **Purpose.** Use an LLM for free wording, with the same schema and a safe fallback.
 
+```mermaid
+flowchart TD
+    IN[/"Requirement text"/] --> PR["Prompt: JSON schema of Requirement<br/>and the text, system EXTRACT_SYSTEM"]
+    PR --> CALL["llm.complete"]
+    CALL -- "LLMError" --> FB
+    CALL --> STRIP["Remove the code fence"]
+    STRIP --> VAL{"Requirement.model_validate_json"}
+    VAL -- "valid" --> OK[/"Extraction, method llm:provider:model"/]
+    VAL -- "invalid" --> TRY{"Retry left?<br/>retries = 1"}
+    TRY -- "yes" --> ADD["Add the first validation error<br/>to the prompt"]
+    ADD --> CALL
+    TRY -- "no" --> FB["RuleBasedExtractor"]
+    FB --> NOTE[/"Rule-based Extraction, first assumption:<br/>LLM extraction rejected"/]
+```
+
 | Input | Output |
 |---|---|
-| A requirement text and an `LLM` | An `Extraction` with the method `llm:<model name>`, or the rule-based result with a rejection note |
+| A requirement text and an `LLM` | An `Extraction` with the method `llm:<provider>:<model>` (for example `llm:openai:gpt-4.1-mini`), or the rule-based result with a rejection note |
 
 **Procedure**
 
@@ -351,11 +559,41 @@ flowchart TB
 - `OPENAI_API_KEY` is necessary only when the host is `api.openai.com`. A local server needs no key.
 - The HTTP timeout is 60 seconds. An HTTP or JSON error raises `LLMError`.
 
+The LLM adapters in `llm.py` make one HTTP call for each `complete`:
+
+```mermaid
+flowchart LR
+    CFG[/"CLOUDQUOTE_LLM_PROVIDER"/] --> BUILD{"build_llm"}
+    BUILD -- "none" --> NONE[/"No LLM: offline mode"/]
+    BUILD -- "openai" --> OA["OpenAICompatibleLLM:<br/>POST base_url/chat/completions"]
+    BUILD -- "gemini" --> GM["GeminiLLM:<br/>POST models/model:generateContent"]
+    BUILD -- "other name" --> VE[/"ValueError"/]
+    OA --> POST["_post_json: timeout 60 s"]
+    GM --> POST
+    POST -- "HTTP, URL or JSON error" --> LE[/"LLMError"/]
+    POST --> TXT[/"Reply text"/]
+```
+
 ---
 
 ## 9. The pricing catalog
 
 **Purpose.** Hold the prices in one versioned file that the code validates at load time.
+
+```mermaid
+flowchart TD
+    ENV[/"CLOUDQUOTE_CATALOG"/] --> PATH{"Path set?"}
+    PATH -- "no" --> DEF[("data/sample_catalog.json")]
+    PATH -- "yes" --> FILE[/"Your catalog JSON"/]
+    DEF --> LOAD["load_catalog"]
+    FILE --> LOAD
+    LOAD --> EX{"File exists?"}
+    EX -- "no" --> FNF[/"FileNotFoundError"/]
+    EX -- "yes" --> SKU["Validate each SKU: kind fixes the unit,<br/>sku_id starts with provider, price 0 or more"]
+    SKU --> CAT{"Duplicate sku_id, provider with no region,<br/>or sample without the word sample?"}
+    CAT -- "yes" --> VE[/"ValidationError"/]
+    CAT -- "no" --> OUT[/"Frozen Catalog"/]
+```
 
 | Input | Output |
 |---|---|
@@ -381,6 +619,24 @@ flowchart TB
 ## 10. The SKU matcher
 
 **Purpose.** Select, for each provider, the cheapest SKU that meets each constraint.
+
+```mermaid
+flowchart TD
+    SPEC[/"ComputeSpec and provider"/] --> ALL["catalog.compute(provider)"]
+    ALL --> FIT{"vCPUs, RAM and GPUs<br/>at least the request?"}
+    FIT -- "no" --> DROP["Remove the SKU"]
+    FIT -- "yes" --> GPU{"GPU SKU and<br/>no GPU requested?"}
+    GPU -- "yes" --> DROP
+    GPU -- "no" --> BUR{"Burstable SKU and<br/>workload not burstable?"}
+    BUR -- "yes" --> DROP
+    BUR -- "no" --> KEEP["Keep the candidate"]
+    KEEP --> SORT["Sort by price, vCPUs, RAM, sku_id"]
+    SORT --> ANY{"Any candidate?"}
+    ANY -- "no" --> NM[/"NoMatchingSku"/]
+    ANY -- "yes" --> OUT[/"First ComputeSku"/]
+    SSPEC[/"StorageSpec"/] --> TIER["Storage SKUs with access_tier = access,<br/>cheapest first"]
+    TIER --> SOUT[/"StorageSku or NoMatchingSku"/]
+```
 
 | Input | Output |
 |---|---|
@@ -413,6 +669,27 @@ flowchart TB
 
 **Purpose.** Price each part with a fixed unit pair, and prove that each rate belongs to its SKU.
 
+```mermaid
+flowchart TD
+    REQ[/"Requirement and Catalog"/] --> EST["estimate: one quote_provider<br/>for each provider"]
+    EST --> C{"compute?"}
+    C -- "yes" --> CL["_compute_line: hours x count,<br/>USD/hour"]
+    EST --> S{"storage?"}
+    S -- "yes" --> MIN{"Term shorter than<br/>min_storage_days?"}
+    MIN -- "yes" --> WARN["Bill the minimum, add a warning"]
+    MIN -- "no" --> SL["_storage_lines: GB, USD/GB-month,<br/>retrieval line if any"]
+    WARN --> SL
+    EST --> E{"egress more than 0?"}
+    E -- "yes" --> EL["_egress_line: egress minus free GB,<br/>USD/GB"]
+    CL --> LI["LineItem checks the unit pair,<br/>else UnitMismatch"]
+    SL --> LI
+    EL --> LI
+    LI --> VER{"verify_quote:<br/>provider, kind, rate, unit"}
+    VER -- "mismatch" --> VE[/"ValueError"/]
+    VER -- "pass" --> Q["Quote: lines, warnings, unavailable"]
+    Q --> CH[/"Estimate.cheapest:<br/>lowest monthly total of complete quotes"/]
+```
+
 | Input | Output |
 |---|---|
 | The catalog and a `Requirement` | An `Estimate` with one `Quote` for each provider |
@@ -439,6 +716,19 @@ flowchart TB
 ## 12. Explanations
 
 **Purpose.** Give a short text summary that cannot contradict the computed numbers.
+
+```mermaid
+flowchart TD
+    EST[/"Estimate"/] --> BASE["explain: one line for each provider,<br/>cheapest, sample disclaimer"]
+    BASE --> ON{"CLOUDQUOTE_EXPLAIN_WITH_LLM<br/>and an LLM?"}
+    ON -- "no" --> DET[/"Deterministic text"/]
+    ON -- "yes" --> ASK["explain_with_llm:<br/>rewrite in at most 5 sentences"]
+    ASK --> ERR{"LLMError or empty text?"}
+    ERR -- "yes" --> DET
+    ERR -- "no" --> NUM{"numbers_consistent:<br/>each dollar amount in the allowed set?"}
+    NUM -- "no" --> DET
+    NUM -- "yes" --> LLMT[/"LLM text"/]
+```
 
 | Input | Output |
 |---|---|
@@ -476,6 +766,30 @@ flowchart TB
 
 **Procedure (Streamlit UI)**
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Engineer
+    participant UI as Streamlit page
+    participant SVC as QuoteService
+    participant EXT as Extractor
+    participant ST as session_state
+
+    UI->>SVC: get_service, cached: Settings, catalog, extractor
+    UI-->>U: disclaimer and example text
+    U->>UI: Extract requirement
+    UI->>EXT: extract(text)
+    EXT-->>UI: Extraction or ExtractionError
+    UI->>ST: spec_json and assumptions
+    UI-->>U: assumptions and editable JSON
+    U->>UI: edit the JSON
+    UI->>SVC: from_requirement(spec_json)
+    SVC-->>UI: Estimate or ValidationError
+    UI-->>U: one column for each provider, explanation
+    U->>UI: Download quote (JSON)
+    UI-->>U: quote.json
+```
+
 1. The page shows the catalog disclaimer and an example text.
 2. `Extract requirement` runs the configured extractor and shows the assumptions.
 3. The structured requirement is an editable JSON text. Each change is validated before the price calculation.
@@ -492,6 +806,20 @@ flowchart TB
 ## 14. The evaluation harness
 
 **Purpose.** Measure extraction, SKU selection and cost against hand-computed values.
+
+```mermaid
+flowchart TD
+    SET[("eval_set.jsonl<br/>17 items")] --> LOAD["load_eval_set: id, text, expected"]
+    LOAD --> ROW["For each item: extractor.extract"]
+    ROW --> OK{"ExtractionError?"}
+    OK -- "yes" --> MISS["Each expected field and SKU is a miss"]
+    OK -- "no" --> FLD["Compare each expected field,<br/>float within 1%"]
+    FLD --> EST["estimate(catalog, requirement)"]
+    EST --> SKU["Compare selected SKUs<br/>with expected_skus"]
+    SKU --> ERR["Absolute error of the monthly total<br/>against expected_monthly_usd"]
+    MISS --> REP[/"EvalReport: field_accuracy, sku_accuracy,<br/>cost_mae_usd, failures"/]
+    ERR --> REP
+```
 
 | Input | Output |
 |---|---|
@@ -540,6 +868,24 @@ flowchart TB
 | Warning | A minimum storage duration changed the billed months |
 
 Worked example (sample prices): 2 instances with 4 vCPUs and 16 GiB, 24/7, 2 TB hot storage, 500 GB egress, 12 months.
+
+```mermaid
+flowchart LR
+    REQ[/"2 x 4 vCPU, 16 GiB, 730 h/month<br/>2,048 GB frequent, 500 GB egress, 12 months"/] --> AC["AWS m5.xlarge<br/>1,460 h x 0.192 = $280.32"]
+    REQ --> AS["AWS S3 Standard<br/>2,048 GB x 0.023 = $47.10"]
+    REQ --> AE["AWS egress<br/>500 - 100 free = 400 GB x 0.09 = $36.00"]
+    AC --> AT["AWS monthly $363.42<br/>12 months $4,361.09"]
+    AS --> AT
+    AE --> AT
+    REQ --> GC["GCP e2-standard-4<br/>1,460 h x 0.134 = $195.64"]
+    REQ --> GS["GCP Cloud Storage Standard<br/>2,048 GB x 0.020 = $40.96"]
+    REQ --> GE["GCP egress<br/>500 GB x 0.12 = $60.00"]
+    GC --> GT["GCP monthly $296.60<br/>12 months $3,559.20"]
+    GS --> GT
+    GE --> GT
+    AT --> CH[/"Cheapest complete quote: GCP"/]
+    GT --> CH
+```
 
 | Provider | Compute | Storage | Egress | Monthly total | 12-month total |
 |---|---|---|---|---|---|
@@ -623,7 +969,7 @@ cloudquote eval          # compare the LLM extractor with the rule-based numbers
 | `OPENAI_API_KEY` | LLM adapters | Necessary for the hosted OpenAI endpoint |
 | `GEMINI_API_KEY` | LLM adapters | Necessary for `CLOUDQUOTE_LLM_PROVIDER=gemini` |
 
-An unknown extractor or provider name causes an error at start.
+An unknown extractor name causes an error at start. An unknown provider name causes an error when a command needs the LLM.
 Credentials are only in a local `.env` file. Git ignores this file. Do not print or commit credentials.
 
 ---
